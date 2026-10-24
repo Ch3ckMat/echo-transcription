@@ -243,7 +243,9 @@ function removeItem(item) {
 }
 
 function updateControls() {
-  const transcribable = state.files.some((f) => f.status === 'ready' || f.status === 'done');
+  // Un fichier est transcribable dès que son décodage a réussi (audioData
+  // présent) — même si une tentative de transcription a échoué (réessayable).
+  const transcribable = state.files.some((f) => f.audioData !== null);
   // Pendant le décodage d'une sélection, on attend : lancer maintenant
   // traiterait les fichiers déjà décodés et ignorerait les autres.
   const decoding = state.files.some((f) => f.status === 'decoding');
@@ -251,8 +253,10 @@ function updateControls() {
   els.languageSelect.disabled = state.busy;
   els.modelSelect.disabled = state.busy;
   if (!state.busy && !decoding) {
-    const pending = state.files.filter((f) => f.status === 'ready' && f.result === null).length;
-    const total = state.files.filter((f) => f.status === 'ready' || f.status === 'done').length;
+    const pending = state.files.filter(
+      (f) => f.audioData !== null && f.result === null && f.status !== 'decoding'
+    ).length;
+    const total = state.files.filter((f) => f.audioData !== null).length;
     els.transcribeLabel.textContent =
       pending === 0 && total > 0
         ? 'Retranscrire tout'
@@ -435,6 +439,7 @@ async function createEngine() {
         // Worker interrompu en cours d'exécution : on débloque toutes les attentes.
         state.engineFatal = true;
         state.engineReady = false;
+        state.engine = null; // worker cassé : ne pas le réutiliser au prochain essai
         resolveAllPending('Le moteur de transcription a été interrompu.');
         if (state.pendingLoad) {
           state.pendingLoad();
@@ -560,9 +565,10 @@ function transcribeOne(engine, item, language) {
 }
 
 async function transcribe() {
-  // Cible : les fichiers décodés sans résultat ; sinon tout (retranscription).
-  let targets = state.files.filter((f) => f.status === 'ready' && f.result === null);
-  if (targets.length === 0) targets = state.files.filter((f) => f.status === 'done');
+  // Cible : les fichiers décodés sans résultat (y compris ceux dont une
+  // tentative a échoué — ils restent réessayables) ; sinon tous (retranscription).
+  let targets = state.files.filter((f) => f.audioData !== null && f.result === null);
+  if (targets.length === 0) targets = state.files.filter((f) => f.audioData !== null);
   if (targets.length === 0) return;
 
   clearError();
@@ -653,12 +659,9 @@ async function transcribe() {
       } else {
         item.result = res.text;
         item.status = 'done';
-      }
-      renderFileList();
-      renderResults();
-      // Retranscription : la carte existante affiche l'ancien texte,
-      // on remplace son contenu par le nouveau résultat.
-      if (item.result !== null) {
+        // Retranscription réussie : la carte existante affiche l'ancien texte,
+        // on remplace son contenu par le nouveau résultat (uniquement pour
+        // ce fichier — les éditions des autres cartes sont préservées).
         const card = els.resultCards.querySelector(`[data-id="${item.id}"]`);
         if (card) {
           const textarea = card.querySelector('textarea');
@@ -666,6 +669,8 @@ async function transcribe() {
           updateCount(card);
         }
       }
+      renderFileList();
+      renderResults();
       updateControls();
     }
   } finally {
