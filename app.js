@@ -46,6 +46,7 @@ const state = {
   engineReady: false,
   engineFatal: false,
   pendingSend: null,
+  pendingLoad: null,
   pendingResults: new Map(), // id du fichier -> resolve(result|{error})
   busy: false,
   elapsedTimer: null,
@@ -243,10 +244,13 @@ function removeItem(item) {
 
 function updateControls() {
   const transcribable = state.files.some((f) => f.status === 'ready' || f.status === 'done');
-  els.transcribeButton.disabled = state.busy || !transcribable;
+  // Pendant le décodage d'une sélection, on attend : lancer maintenant
+  // traiterait les fichiers déjà décodés et ignorerait les autres.
+  const decoding = state.files.some((f) => f.status === 'decoding');
+  els.transcribeButton.disabled = state.busy || decoding || !transcribable;
   els.languageSelect.disabled = state.busy;
   els.modelSelect.disabled = state.busy;
-  if (!state.busy) {
+  if (!state.busy && !decoding) {
     const pending = state.files.filter((f) => f.status === 'ready' && f.result === null).length;
     const total = state.files.filter((f) => f.status === 'ready' || f.status === 'done').length;
     els.transcribeLabel.textContent =
@@ -398,7 +402,11 @@ function onEngineMessage(message) {
     if (resolve) {
       state.pendingResults.delete(message.id);
       resolve({ error: message.message });
+      return;
     }
+    // Échec du chargement du modèle (pas d'id de fichier) : on débloque
+    // l'attente de « load » pour ne pas laisser la file bloquée indéfiniment.
+    if (state.pendingLoad) state.pendingLoad();
     return;
   }
 }
@@ -424,11 +432,13 @@ async function createEngine() {
     if (booted) {
       worker.addEventListener('message', (e) => onEngineMessage(e.data));
       worker.addEventListener('error', () => {
-        // Worker interrompu en cours d'exécution : on débloque l'attente.
+        // Worker interrompu en cours d'exécution : on débloque toutes les attentes.
         state.engineFatal = true;
         state.engineReady = false;
         resolveAllPending('Le moteur de transcription a été interrompu.');
-        if (typeof state.pendingSend === 'function') {
+        if (state.pendingLoad) {
+          state.pendingLoad();
+        } else if (typeof state.pendingSend === 'function') {
           const send = state.pendingSend;
           state.pendingSend = null;
           send();
@@ -591,17 +601,24 @@ async function transcribe() {
   }
 
   // L'audio n'est envoyé qu'une fois le modèle prêt (voir « ready » dans onEngineMessage).
-  await new Promise((resolve) => {
-    state.pendingSend = resolve;
+  // Un échec du chargement (réseau, mémoire) débloque cette promesse avec false.
+  const loaded = await new Promise((resolve) => {
+    const done = (ok) => {
+      state.pendingLoad = null;
+      state.pendingSend = null;
+      resolve(ok);
+    };
+    state.pendingLoad = () => done(false);
+    state.pendingSend = () => done(true);
     engine.post({ type: 'load', modelId, device: requestedDevice });
   });
-  if (state.engineFatal) {
-    state.engine = null;
+  if (!loaded || state.engineFatal) {
+    state.engine = null; // moteur cassé : on le recréera au prochain essai
     state.busy = false;
     updateControls();
     hideStatus();
     showError(
-      "Le moteur de transcription a été interrompu. Rechargez la page puis relancez la transcription."
+      "Le modèle n'a pas pu être chargé. Vérifiez votre connexion, puis relancez la transcription."
     );
     return;
   }
@@ -610,41 +627,54 @@ async function transcribe() {
   const failures = [];
   state.elapsedStart = Date.now();
 
-  for (let i = 0; i < total; i++) {
-    const item = targets[i];
-    item.status = 'running';
-    renderFileList();
-    state.runLabel = `Transcription ${i + 1}/${total} — ${item.file.name}`;
-    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
-    state.elapsedTimer = setInterval(() => {
-      const elapsed = Math.round((Date.now() - state.elapsedStart) / 1000);
-      setStatus(`${state.runLabel} · ${elapsed} s`, { engine: els.statusEngine.textContent });
-    }, 1000);
-    setStatus(`${state.runLabel} · 0 s`, { engine: els.statusEngine.textContent });
+  try {
+    for (let i = 0; i < total; i++) {
+      const item = targets[i];
+      item.status = 'running';
+      renderFileList();
+      state.runLabel = `Transcription ${i + 1}/${total} — ${item.file.name}`;
+      if (state.elapsedTimer) clearInterval(state.elapsedTimer);
+      state.elapsedTimer = setInterval(() => {
+        const elapsed = Math.round((Date.now() - state.elapsedStart) / 1000);
+        setStatus(`${state.runLabel} · ${elapsed} s`, { engine: els.statusEngine.textContent });
+      }, 1000);
+      setStatus(`${state.runLabel} · 0 s`, { engine: els.statusEngine.textContent });
 
-    const res = await transcribeOne(engine, item, language);
+      const res = await transcribeOne(engine, item, language);
 
-    if (res.error) {
-      item.status = 'error';
-      item.error = res.error;
-      failures.push(item);
-    } else if (!res.text) {
-      item.status = 'error';
-      item.error = 'aucune parole détectée';
-      failures.push(item);
-    } else {
-      item.result = res.text;
-      item.status = 'done';
+      if (res.error) {
+        item.status = 'error';
+        item.error = res.error;
+        failures.push(item);
+      } else if (!res.text) {
+        item.status = 'error';
+        item.error = 'aucune parole détectée';
+        failures.push(item);
+      } else {
+        item.result = res.text;
+        item.status = 'done';
+      }
+      renderFileList();
+      renderResults();
+      // Retranscription : la carte existante affiche l'ancien texte,
+      // on remplace son contenu par le nouveau résultat.
+      if (item.result !== null) {
+        const card = els.resultCards.querySelector(`[data-id="${item.id}"]`);
+        if (card) {
+          const textarea = card.querySelector('textarea');
+          textarea.value = item.result;
+          updateCount(card);
+        }
+      }
+      updateControls();
     }
-    renderFileList();
-    renderResults();
+  } finally {
+    hideStatus();
+    state.busy = false;
     updateControls();
+    renderFileList();
   }
 
-  hideStatus();
-  state.busy = false;
-  updateControls();
-  renderFileList();
   if (failures.length > 0) {
     showError(
       `${failures.length} fichier${failures.length > 1 ? 's' : ''} n'a${
