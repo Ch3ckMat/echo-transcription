@@ -91,12 +91,13 @@ self.addEventListener('message', async (event) => {
       });
 
       const text = (output?.text ?? '').trim();
-      self.postMessage({ type: 'result', text });
+      self.postMessage({ type: 'result', id: message.id, text });
       return;
     }
   } catch (err) {
     self.postMessage({
       type: 'error',
+      id: message?.id ?? null,
       message: err?.message || 'Une erreur inattendue s’est produite.',
     });
   }

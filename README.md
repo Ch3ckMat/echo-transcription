@@ -7,12 +7,14 @@ aucune clé API nécessaire.
 
 ## Fonctionnalités
 
-- Dépôt de fichier par glisser-déposer ou sélection (MP3, WAV, OGG, M4A, FLAC, WEBM)
+- Dépôt de **plusieurs fichiers à la fois** (glisser-déposer ou sélection) : file d'attente avec état par fichier (en attente, en cours, terminé, erreur)
+- Formats acceptés : MP3, WAV, OGG, M4A, FLAC, WEBM
 - Trois qualités de modèle : tiny (~40 Mo), base (~80 Mo, par défaut), small (~250 Mo)
 - Langue de l'audio sélectionnable (français par défaut, détection automatique possible)
 - Accélération WebGPU automatique avec repli CPU (WASM)
 - Fichiers longs gérés par fenêtre glissante (segments de 30 s, recouvrement 5 s)
-- Résultat modifiable, copie vers le presse-papiers, téléchargement `.txt`
+- Résultats par fichier, modifiables, copie vers le presse-papiers, téléchargement `.txt` individuel ou global (« Tout télécharger »)
+- Écoute de chaque fichier directement dans la file d'attente
 - Thème clair / sombre automatique
 - Exécution dans un Web Worker quand le contexte le permet (interface fluide),
   avec repli sur le fil principal pour les contextes sandboxés (aperçus intégrés)

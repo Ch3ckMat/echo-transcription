@@ -1,19 +1,16 @@
-// Écho — logique principale : dépôt du fichier, décodage audio, pilotage du moteur.
+// Écho — logique principale : dépôt des fichiers, décodage audio, pilotage du moteur.
 const $ = (id) => document.getElementById(id);
 
 const els = {
   dropzone: $('dropzone'),
   dropzoneButton: $('dropzone-button'),
   fileInput: $('file-input'),
-  fileCard: $('file-card'),
-  fileName: $('file-name'),
-  fileSize: $('file-size'),
-  fileDuration: $('file-duration'),
-  fileRemove: $('file-remove'),
-  audioPlayer: $('audio-player'),
+  fileListCard: $('file-list-card'),
+  fileList: $('file-list'),
   languageSelect: $('language-select'),
   modelSelect: $('model-select'),
   transcribeButton: $('transcribe-button'),
+  transcribeLabel: $('transcribe-label'),
   status: $('status'),
   statusSpinner: $('status-spinner'),
   statusText: $('status-text'),
@@ -22,12 +19,10 @@ const els = {
   progressBar: $('progress-bar'),
   error: $('error'),
   errorText: $('error-text'),
-  resultCard: $('result-card'),
-  resultTextarea: $('result-textarea'),
-  resultCount: $('result-count'),
-  copyButton: $('copy-button'),
-  copyButtonLabel: $('copy-button-label'),
-  downloadButton: $('download-button'),
+  results: $('results'),
+  resultsTitle: $('results-title'),
+  resultCards: $('result-cards'),
+  downloadAllButton: $('download-all-button'),
 };
 
 const MODELS = {
@@ -45,15 +40,19 @@ const DEVICE_DTYPES = {
 };
 
 const state = {
-  file: null,
-  audioData: null, // Float32Array 16 kHz mono
-  duration: 0,
+  files: [], // { id, file, audioData, duration, status, result, error, objectUrl }
+  // status : 'decoding' | 'ready' | 'running' | 'done' | 'error'
   engine: null,
+  engineReady: false,
+  engineFatal: false,
   pendingSend: null,
+  pendingResults: new Map(), // id du fichier -> resolve(result|{error})
   busy: false,
   elapsedTimer: null,
   elapsedStart: 0,
+  runLabel: '',
 };
+let fileId = 0;
 
 /* ————— Utilitaires ————— */
 
@@ -99,36 +98,83 @@ function hideStatus() {
   }
 }
 
-function setBusy(busy) {
-  state.busy = busy;
-  els.transcribeButton.disabled = busy || !state.file;
-  els.fileRemove.disabled = busy;
-  els.languageSelect.disabled = busy;
-  els.modelSelect.disabled = busy;
+/* ————— Liste de fichiers ————— */
+
+function fileItem(id) {
+  return state.files.find((f) => f.id === id);
 }
 
-/* ————— Sélection du fichier ————— */
+function badgeFor(item) {
+  if (item.status === 'decoding') return { text: 'Analyse…', cls: 'badge-pending' };
+  if (item.status === 'running') return { text: 'En cours', cls: 'badge-running' };
+  if (item.status === 'done') return { text: 'Terminé', cls: 'badge-done' };
+  if (item.status === 'error') return { text: 'Erreur', cls: 'badge-error' };
+  return { text: 'En attente', cls: 'badge-pending' };
+}
 
-async function handleFile(file) {
-  clearError();
-  state.file = file;
-  state.audioData = null;
-  state.duration = 0;
+function buildRow(item) {
+  const li = document.createElement('li');
+  li.className = 'file-item';
+  li.dataset.id = item.id;
+  li.innerHTML = `
+    <div class="file-head">
+      <svg class="file-icon" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+      </svg>
+      <div class="file-meta">
+        <p class="file-name"></p>
+        <p class="file-details"><span class="file-size"></span> · <span class="file-duration"></span></p>
+      </div>
+      <span class="badge"></span>
+      <button type="button" class="btn btn-ghost btn-icon file-play" aria-label="Écouter le fichier" data-testid="button-play">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+      </button>
+      <button type="button" class="btn btn-ghost btn-icon file-remove" aria-label="Retirer le fichier" data-testid="button-remove-file">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <audio controls class="audio-player" hidden data-testid="audio-player"></audio>`;
+  // Le nom du fichier vient de l'utilisateur : textContent, jamais innerHTML.
+  li.querySelector('.file-name').textContent = item.file.name;
+  li.querySelector('.file-size').textContent = formatBytes(item.file.size);
+  return li;
+}
 
-  els.resultCard.hidden = true;
-  // Quand un fichier est chargé, la zone de dépôt devient redondante :
-  // on la masque pour garder le bouton d'action à l'écran.
-  els.dropzone.hidden = true;
-  els.fileName.textContent = file.name;
-  els.fileSize.textContent = formatBytes(file.size);
-  els.fileDuration.textContent = 'analyse…';
-  els.fileCard.hidden = false;
-  els.audioPlayer.src = URL.createObjectURL(file);
-  // Le bouton reste désactivé jusqu'à ce que le décodage audio soit terminé.
+function renderFileList() {
+  els.fileList.replaceChildren(...state.files.map(buildRow));
+  for (const li of els.fileList.children) {
+    const item = fileItem(Number(li.dataset.id));
+    if (!item) continue;
+    const badge = badgeFor(item);
+    const badgeEl = li.querySelector('.badge');
+    badgeEl.textContent = badge.text;
+    badgeEl.className = `badge ${badge.cls}`;
+    const durationEl = li.querySelector('.file-duration');
+    if (item.status === 'error') {
+      durationEl.textContent = item.error ?? 'erreur';
+      durationEl.classList.add('file-details-error');
+    } else {
+      durationEl.textContent =
+        item.duration === null ? 'analyse…' : formatDuration(item.duration);
+      durationEl.classList.remove('file-details-error');
+    }
+    const removeBtn = li.querySelector('.file-remove');
+    removeBtn.disabled = state.busy || item.status === 'running';
+    const playBtn = li.querySelector('.file-play');
+    playBtn.disabled = state.busy || item.objectUrl === null;
+    if (item.objectUrl !== null) {
+      li.querySelector('audio').src = item.objectUrl;
+    }
+  }
+  els.fileListCard.hidden = state.files.length === 0;
+}
 
-  // Décodage en PCM mono 16 kHz, format attendu par Whisper.
+/* ————— Décodage audio ————— */
+
+// Décodage en PCM mono 16 kHz, format attendu par Whisper.
+async function decodeItem(item) {
   try {
-    const buffer = await file.arrayBuffer();
+    const buffer = await item.file.arrayBuffer();
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const decoded = await audioCtx.decodeAudioData(buffer.slice(0));
     audioCtx.close();
@@ -142,31 +188,74 @@ async function handleFile(file) {
     source.start();
     const rendered = await offline.startRendering();
 
-    state.audioData = rendered.getChannelData(0);
-    state.duration = decoded.duration;
-    els.fileDuration.textContent = formatDuration(state.duration);
-    els.transcribeButton.disabled = state.busy;
+    item.audioData = rendered.getChannelData(0);
+    item.duration = decoded.duration;
+    item.status = 'ready';
   } catch (err) {
-    resetFile();
+    item.status = 'error';
+    item.error = 'fichier audio illisible';
+  }
+}
+
+async function addFiles(list) {
+  clearError();
+  const toDecode = [];
+  for (const file of list) {
+    const item = {
+      id: ++fileId,
+      file,
+      audioData: null,
+      duration: null,
+      status: 'decoding',
+      result: null,
+      error: null,
+      objectUrl: URL.createObjectURL(file),
+    };
+    state.files.push(item);
+    toDecode.push(item);
+  }
+  renderFileList();
+  updateControls();
+  // Décodage séquentiel : évite d'ouvrir plusieurs AudioContext en parallèle.
+  for (const item of toDecode) {
+    if (!state.files.includes(item)) continue; // retiré pendant l'analyse
+    await decodeItem(item);
+    renderFileList();
+    updateControls();
+  }
+  const failed = toDecode.filter((f) => f.status === 'error');
+  if (failed.length > 0) {
     showError(
-      'Impossible de lire ce fichier audio. Formats acceptés : MP3, WAV, OGG, M4A, FLAC, WEBM. Si le fichier est lisible, essayez un autre format.'
+      `${failed.length === 1 ? 'Ce fichier est' : 'Ces fichiers sont'} illisible(s) : ` +
+        `${failed.map((f) => f.file.name).join(', ')}. Formats acceptés : MP3, WAV, OGG, M4A, FLAC, WEBM.`
     );
   }
 }
 
-function resetFile() {
-  if (state.busy) return;
-  state.file = null;
-  state.audioData = null;
-  state.duration = 0;
-  els.fileCard.hidden = true;
-  els.dropzone.hidden = false;
-  els.audioPlayer.pause();
-  els.audioPlayer.removeAttribute('src');
-  els.transcribeButton.disabled = true;
-  els.resultCard.hidden = true;
-  hideStatus();
-  clearError();
+function removeItem(item) {
+  if (state.busy || item.status === 'running') return;
+  state.files = state.files.filter((f) => f !== item);
+  if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+  renderFileList();
+  renderResults();
+  updateControls();
+}
+
+function updateControls() {
+  const transcribable = state.files.some((f) => f.status === 'ready' || f.status === 'done');
+  els.transcribeButton.disabled = state.busy || !transcribable;
+  els.languageSelect.disabled = state.busy;
+  els.modelSelect.disabled = state.busy;
+  if (!state.busy) {
+    const pending = state.files.filter((f) => f.status === 'ready' && f.result === null).length;
+    const total = state.files.filter((f) => f.status === 'ready' || f.status === 'done').length;
+    els.transcribeLabel.textContent =
+      pending === 0 && total > 0
+        ? 'Retranscrire tout'
+        : pending > 1
+          ? `Transcrire ${pending} fichiers`
+          : 'Transcrire l\'audio';
+  }
 }
 
 /* ————— Dépôt par glisser-déposer ————— */
@@ -184,17 +273,41 @@ function resetFile() {
   });
 });
 els.dropzone.addEventListener('drop', (event) => {
-  const file = event.dataTransfer?.files?.[0];
-  if (file) handleFile(file);
+  const files = [...(event.dataTransfer?.files ?? [])];
+  if (files.length > 0) addFiles(files);
 });
 
 els.dropzoneButton.addEventListener('click', () => els.fileInput.click());
 els.fileInput.addEventListener('change', () => {
-  const file = els.fileInput.files?.[0];
-  if (file) handleFile(file);
+  const files = [...(els.fileInput.files ?? [])];
+  if (files.length > 0) addFiles(files);
   els.fileInput.value = '';
 });
-els.fileRemove.addEventListener('click', resetFile);
+
+// Interactions sur la liste (écouter / retirer), par délégation.
+els.fileList.addEventListener('click', (event) => {
+  const li = event.target.closest('.file-item');
+  if (!li) return;
+  const item = fileItem(Number(li.dataset.id));
+  if (!item) return;
+
+  if (event.target.closest('.file-remove') && !state.busy) {
+    removeItem(item);
+    return;
+  }
+  if (event.target.closest('.file-play')) {
+    const audio = li.querySelector('audio');
+    // On met en pause les autres lecteurs avant d'afficher celui-ci.
+    for (const other of els.fileList.querySelectorAll('audio')) {
+      if (other !== audio) {
+        other.pause();
+        other.hidden = true;
+      }
+    }
+    audio.hidden = !audio.hidden;
+    if (!audio.hidden) audio.play().catch(() => {});
+  }
+});
 
 /* ————— Moteur de transcription ————— */
 // Deux modes, même protocole de messages :
@@ -224,15 +337,9 @@ function updateDownloadProgress() {
   }
 }
 
-function startElapsedTimer() {
-  state.elapsedStart = Date.now();
-  setStatus('Transcription en cours… 0 s', { engine: els.statusEngine.textContent });
-  state.elapsedTimer = setInterval(() => {
-    const elapsed = Math.round((Date.now() - state.elapsedStart) / 1000);
-    setStatus(`Transcription en cours… ${elapsed} s`, {
-      engine: els.statusEngine.textContent,
-    });
-  }, 1000);
+function resolveAllPending(error) {
+  for (const resolve of state.pendingResults.values()) resolve({ error });
+  state.pendingResults.clear();
 }
 
 function onEngineMessage(message) {
@@ -268,7 +375,7 @@ function onEngineMessage(message) {
         : message.inline
           ? 'CPU · sans worker'
           : 'WASM';
-    startElapsedTimer();
+    state.engineReady = true;
     if (typeof state.pendingSend === 'function') {
       const send = state.pendingSend;
       state.pendingSend = null;
@@ -278,25 +385,21 @@ function onEngineMessage(message) {
   }
 
   if (message.type === 'result') {
-    hideStatus();
-    setBusy(false);
-    if (!message.text) {
-      showError(
-        "Aucune parole n'a été détectée dans ce fichier. Essayez un enregistrement plus proche de la voix, ou vérifiez la langue sélectionnée."
-      );
-    } else {
-      els.resultTextarea.value = message.text;
-      els.resultCard.hidden = false;
-      updateCount();
-      els.resultTextarea.focus();
+    const resolve = state.pendingResults.get(message.id);
+    if (resolve) {
+      state.pendingResults.delete(message.id);
+      resolve({ text: message.text });
     }
     return;
   }
 
   if (message.type === 'error') {
-    hideStatus();
-    setBusy(false);
-    showError(`La transcription a échoué : ${message.message}`);
+    const resolve = state.pendingResults.get(message.id);
+    if (resolve) {
+      state.pendingResults.delete(message.id);
+      resolve({ error: message.message });
+    }
+    return;
   }
 }
 
@@ -321,12 +424,15 @@ async function createEngine() {
     if (booted) {
       worker.addEventListener('message', (e) => onEngineMessage(e.data));
       worker.addEventListener('error', () => {
-        hideStatus();
-        setBusy(false);
-        state.pendingSend = null;
-        showError(
-          "Le moteur de transcription a été interrompu. Rechargez la page puis relancez la transcription."
-        );
+        // Worker interrompu en cours d'exécution : on débloque l'attente.
+        state.engineFatal = true;
+        state.engineReady = false;
+        resolveAllPending('Le moteur de transcription a été interrompu.');
+        if (typeof state.pendingSend === 'function') {
+          const send = state.pendingSend;
+          state.pendingSend = null;
+          send();
+        }
       });
       return {
         post: (message, transfer) => worker.postMessage(message, transfer),
@@ -405,11 +511,12 @@ async function createEngine() {
             language: message.language || null,
             task: 'transcribe',
           });
-          notify({ type: 'result', text: (output?.text ?? '').trim() });
+          notify({ type: 'result', id: message.id, text: (output?.text ?? '').trim() });
         }
       } catch (err) {
         notify({
           type: 'error',
+          id: message.id ?? null,
           message: err?.message || "Une erreur inattendue s'est produite.",
         });
       }
@@ -422,13 +529,38 @@ async function getEngine() {
   return state.engine;
 }
 
-/* ————— Transcription ————— */
+/* ————— Transcription (files en séquence) ————— */
+
+function transcribeOne(engine, item, language) {
+  return new Promise((resolve) => {
+    if (state.engineFatal) {
+      resolve({ error: 'Le moteur de transcription a été interrompu.' });
+      return;
+    }
+    state.pendingResults.set(item.id, resolve);
+    // Sur le worker, le tampon est transféré (détaché) : on envoie une copie
+    // pour pouvoir relancer une transcription sans recharger le fichier.
+    if (engine.inline) {
+      engine.post({ type: 'transcribe', id: item.id, audio: item.audioData, language });
+    } else {
+      const audio = item.audioData.slice();
+      engine.post({ type: 'transcribe', id: item.id, audio, language }, [audio.buffer]);
+    }
+  });
+}
 
 async function transcribe() {
-  if (!state.file || !state.audioData || state.busy) return;
+  // Cible : les fichiers décodés sans résultat ; sinon tout (retranscription).
+  let targets = state.files.filter((f) => f.status === 'ready' && f.result === null);
+  if (targets.length === 0) targets = state.files.filter((f) => f.status === 'done');
+  if (targets.length === 0) return;
+
   clearError();
-  setBusy(true);
-  els.resultCard.hidden = true;
+  state.busy = true;
+  state.engineFatal = false;
+  state.engineReady = false;
+  updateControls();
+  renderFileList();
 
   const modelId = MODELS[els.modelSelect.value] ?? MODELS.base;
   const language = els.languageSelect.value;
@@ -450,7 +582,8 @@ async function transcribe() {
     engine = await getEngine();
   } catch (err) {
     hideStatus();
-    setBusy(false);
+    state.busy = false;
+    updateControls();
     showError(
       "Le moteur de transcription n'a pas pu démarrer. Vérifiez votre connexion (le modèle se télécharge depuis un CDN), puis rechargez la page."
     );
@@ -458,65 +591,143 @@ async function transcribe() {
   }
 
   // L'audio n'est envoyé qu'une fois le modèle prêt (voir « ready » dans onEngineMessage).
-  // Sur le worker, le tampon est transféré (détaché) : on envoie donc une copie
-  // pour pouvoir relancer une transcription sans recharger le fichier.
-  state.pendingSend = () => {
-    if (engine.inline) {
-      engine.post({ type: 'transcribe', audio: state.audioData, language });
+  await new Promise((resolve) => {
+    state.pendingSend = resolve;
+    engine.post({ type: 'load', modelId, device: requestedDevice });
+  });
+  if (state.engineFatal) {
+    state.engine = null;
+    state.busy = false;
+    updateControls();
+    hideStatus();
+    showError(
+      "Le moteur de transcription a été interrompu. Rechargez la page puis relancez la transcription."
+    );
+    return;
+  }
+
+  const total = targets.length;
+  const failures = [];
+  state.elapsedStart = Date.now();
+
+  for (let i = 0; i < total; i++) {
+    const item = targets[i];
+    item.status = 'running';
+    renderFileList();
+    state.runLabel = `Transcription ${i + 1}/${total} — ${item.file.name}`;
+    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
+    state.elapsedTimer = setInterval(() => {
+      const elapsed = Math.round((Date.now() - state.elapsedStart) / 1000);
+      setStatus(`${state.runLabel} · ${elapsed} s`, { engine: els.statusEngine.textContent });
+    }, 1000);
+    setStatus(`${state.runLabel} · 0 s`, { engine: els.statusEngine.textContent });
+
+    const res = await transcribeOne(engine, item, language);
+
+    if (res.error) {
+      item.status = 'error';
+      item.error = res.error;
+      failures.push(item);
+    } else if (!res.text) {
+      item.status = 'error';
+      item.error = 'aucune parole détectée';
+      failures.push(item);
     } else {
-      const audio = state.audioData.slice();
-      engine.post({ type: 'transcribe', audio, language }, [audio.buffer]);
+      item.result = res.text;
+      item.status = 'done';
     }
-  };
-  engine.post({ type: 'load', modelId, device: requestedDevice });
+    renderFileList();
+    renderResults();
+    updateControls();
+  }
+
+  hideStatus();
+  state.busy = false;
+  updateControls();
+  renderFileList();
+  if (failures.length > 0) {
+    showError(
+      `${failures.length} fichier${failures.length > 1 ? 's' : ''} n'a${
+        failures.length > 1 ? 've' : ''
+      } pas pu être transcrit${failures.length > 1 ? 's' : ''} : ` +
+        `${failures.map((f) => f.file.name).join(', ')}. ` +
+        `Cause la plus fréquente : aucune parole détectée (vérifiez la langue sélectionnée).`
+    );
+  }
 }
 
 els.transcribeButton.addEventListener('click', transcribe);
 
-/* ————— Résultat : copie et téléchargement ————— */
+/* ————— Résultats : cartes, copie et téléchargement ————— */
 
-els.resultTextarea.addEventListener('input', updateCount);
+function resultCardFor(item) {
+  let card = els.resultCards.querySelector(`[data-id="${item.id}"]`);
+  if (card) return card;
 
-function updateCount() {
-  const text = els.resultTextarea.value.trim();
-  const words = text ? text.split(/\s+/).length : 0;
-  els.resultCount.textContent = `${words} mot${words > 1 ? 's' : ''} · ${text.length} caractères`;
+  card = document.createElement('article');
+  card.className = 'card result-card';
+  card.dataset.id = item.id;
+  card.innerHTML = `
+    <div class="result-head">
+      <div class="result-head-meta">
+        <h3 class="result-title"></h3>
+        <p class="result-count" data-testid="text-count"></p>
+      </div>
+    </div>
+    <textarea class="result-textarea" rows="8" spellcheck="false" data-testid="textarea-result" aria-label="Texte transcrit, modifiable"></textarea>
+    <div class="result-actions">
+      <button type="button" class="btn btn-primary" data-action="copy" data-testid="button-copy">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <span class="copy-label">Copier</span>
+      </button>
+      <button type="button" class="btn" data-action="download" data-testid="button-download">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Télécharger (.txt)
+      </button>
+    </div>`;
+  // Nom de fichier fourni par l'utilisateur : textContent uniquement.
+  card.querySelector('.result-title').textContent = item.file.name;
+  card.querySelector('textarea').value = item.result ?? '';
+  card.querySelector('textarea').addEventListener('input', () => updateCount(card));
+  updateCount(card);
+  return card;
 }
 
-els.copyButton.addEventListener('click', async () => {
-  const text = els.resultTextarea.value;
-  if (!text) return;
-  let copied = false;
-  try {
-    await navigator.clipboard.writeText(text);
-    copied = true;
-  } catch {
-    // Repli pour les contextes sans Clipboard API (iframe sandbox…)
-    els.resultTextarea.select();
-    copied = document.execCommand('copy');
+function updateCount(card) {
+  const text = card.querySelector('textarea').value.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  card.querySelector('.result-count').textContent =
+    `${words} mot${words > 1 ? 's' : ''} · ${text.length} caractères`;
+}
+
+function renderResults() {
+  const items = state.files.filter((f) => f.result !== null);
+  // Retire les cartes des fichiers supprimés ou sans résultat.
+  for (const card of [...els.resultCards.children]) {
+    if (!items.some((f) => f.id === Number(card.dataset.id))) card.remove();
   }
-  if (copied) {
-    els.copyButtonLabel.textContent = 'Copié';
-    setTimeout(() => {
-      els.copyButtonLabel.textContent = 'Copier';
-    }, 2000);
-  } else {
-    // Copie automatique bloquée : on sélectionne tout et on guide l'utilisateur.
-    els.resultTextarea.select();
-    els.copyButtonLabel.textContent = 'Copie bloquée';
-    showError(
-      'La copie automatique est bloquée par ce navigateur. Le texte est sélectionné : utilisez Ctrl+C (ou Cmd+C).'
-    );
-    setTimeout(() => {
-      els.copyButtonLabel.textContent = 'Copier';
-    }, 2000);
+  // Ajoute / réordonne : l'ordre des cartes suit l'ordre des fichiers.
+  let prev = null;
+  for (const item of items) {
+    const card = resultCardFor(item);
+    if (prev) prev.after(card);
+    else els.resultCards.prepend(card);
+    prev = card;
   }
+  els.results.hidden = items.length === 0;
+  els.resultsTitle.textContent = `${items.length} transcription${items.length > 1 ? 's' : ''}`;
+}
+
+els.resultCards.addEventListener('input', (event) => {
+  const card = event.target.closest('.result-card');
+  if (card) updateCount(card);
 });
 
-els.downloadButton.addEventListener('click', () => {
-  const text = els.resultTextarea.value;
+function downloadItem(item) {
+  const card = els.resultCards.querySelector(`[data-id="${item.id}"]`);
+  const text = card ? card.querySelector('textarea').value : (item.result ?? '');
   if (!text) return;
-  const base = (state.file?.name || 'transcription').replace(/\.[^.]+$/, '');
+  const base = (item.file.name || 'transcription').replace(/\.[^.]+$/, '');
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -524,4 +735,56 @@ els.downloadButton.addEventListener('click', () => {
   link.download = `${base}.txt`;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+els.resultCards.addEventListener('click', async (event) => {
+  const card = event.target.closest('.result-card');
+  if (!card) return;
+  const item = fileItem(Number(card.dataset.id));
+  if (!item) return;
+
+  if (event.target.closest('[data-action="download"]')) {
+    downloadItem(item);
+    return;
+  }
+
+  if (event.target.closest('[data-action="copy"]')) {
+    const textarea = card.querySelector('textarea');
+    const label = card.querySelector('.copy-label');
+    if (!textarea.value) return;
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(textarea.value);
+      copied = true;
+    } catch {
+      // Repli pour les contextes sans Clipboard API (iframe sandbox…)
+      textarea.select();
+      copied = document.execCommand('copy');
+    }
+    if (copied) {
+      label.textContent = 'Copié';
+    } else {
+      // Copie automatique bloquée : on sélectionne tout et on guide l'utilisateur.
+      textarea.select();
+      label.textContent = 'Copie bloquée';
+      showError(
+        'La copie automatique est bloquée par ce navigateur. Le texte est sélectionné : utilisez Ctrl+C (ou Cmd+C).'
+      );
+    }
+    setTimeout(() => {
+      label.textContent = 'Copier';
+    }, 2000);
+  }
+});
+
+els.downloadAllButton.addEventListener('click', async () => {
+  const items = state.files.filter((f) => f.result !== null);
+  if (items.length === 0) return;
+  els.downloadAllButton.disabled = true;
+  for (const item of items) {
+    downloadItem(item);
+    // Petit délai entre les téléchargements pour ne pas saturer le navigateur.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+  els.downloadAllButton.disabled = false;
 });

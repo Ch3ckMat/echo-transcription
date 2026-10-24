@@ -48,7 +48,7 @@
 
       <!-- Étape 1 : dépôt du fichier -->
       <section class="card dropzone" id="dropzone" aria-label="Dépôt de fichier audio">
-        <input type="file" id="file-input" class="sr-only" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.webm,.aac,.opus" />
+        <input type="file" id="file-input" class="sr-only" multiple accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.webm,.aac,.opus" />
         <button type="button" class="dropzone-inner" id="dropzone-button" aria-describedby="dropzone-hint">
           <svg class="dropzone-icon" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
             <path d="M12 2a2 2 0 0 0-2 2v7a2 2 0 0 0 4 0V4a2 2 0 0 0-2-2z"/>
@@ -56,27 +56,15 @@
             <line x1="12" y1="19" x2="12" y2="23"/>
             <line x1="8" y1="23" x2="16" y2="23"/>
           </svg>
-          <p class="dropzone-title">Glissez un fichier audio ici</p>
+          <p class="dropzone-title">Glissez vos fichiers audio ici</p>
           <p class="dropzone-action">ou <span class="link">parcourez vos fichiers</span></p>
-          <p class="dropzone-hint" id="dropzone-hint">MP3, WAV, OGG, M4A, FLAC, WEBM — les fichiers longs sont traités par segments</p>
+          <p class="dropzone-hint" id="dropzone-hint">MP3, WAV, OGG, M4A, FLAC, WEBM — plusieurs fichiers possibles, les longs sont traités par segments</p>
         </button>
       </section>
 
-      <!-- Fichier sélectionné -->
-      <section class="card file-card" id="file-card" hidden>
-        <div class="file-head">
-          <svg class="file-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-            <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
-          </svg>
-          <div class="file-meta">
-            <p class="file-name" id="file-name"></p>
-            <p class="file-details"><span id="file-size"></span> · <span id="file-duration"></span></p>
-          </div>
-          <button type="button" class="btn btn-ghost btn-icon" id="file-remove" aria-label="Retirer le fichier" data-testid="button-remove-file">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
-        </div>
-        <audio id="audio-player" controls class="audio-player" data-testid="audio-player"></audio>
+      <!-- Fichiers sélectionnés -->
+      <section class="card" id="file-list-card" hidden>
+        <ul class="file-list" id="file-list"></ul>
       </section>
 
       <!-- Options -->
@@ -114,7 +102,7 @@
       </p>
 
       <button type="button" class="btn btn-primary btn-launch" id="transcribe-button" disabled data-testid="button-transcribe">
-        Transcrire l'audio
+        <span id="transcribe-label">Transcrire l'audio</span>
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>
       </button>
 
@@ -136,23 +124,16 @@
         <p id="error-text" data-testid="text-error"></p>
       </section>
 
-      <!-- Résultat -->
-      <section class="card result-card" id="result-card" hidden>
-        <div class="result-head">
-          <h2 class="result-title">Transcription</h2>
-          <p class="result-count" id="result-count" data-testid="text-count"></p>
-        </div>
-        <textarea id="result-textarea" class="result-textarea" rows="10" spellcheck="false" data-testid="textarea-result" aria-label="Texte transcrit, modifiable"></textarea>
-        <div class="result-actions">
-          <button type="button" class="btn btn-primary" id="copy-button" data-testid="button-copy">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            <span id="copy-button-label">Copier</span>
-          </button>
-          <button type="button" class="btn" id="download-button" data-testid="button-download">
+      <!-- Résultats (une carte par fichier) -->
+      <section id="results" hidden>
+        <div class="results-toolbar">
+          <h2 class="results-title" id="results-title">Transcriptions</h2>
+          <button type="button" class="btn" id="download-all-button" data-testid="button-download-all">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            Télécharger (.txt)
+            Tout télécharger (.txt)
           </button>
         </div>
+        <div id="result-cards"></div>
       </section>
 
     </main>
