@@ -124,7 +124,7 @@ async function handleFile(file) {
   els.fileDuration.textContent = 'analyse…';
   els.fileCard.hidden = false;
   els.audioPlayer.src = URL.createObjectURL(file);
-  els.transcribeButton.disabled = false;
+  // Le bouton reste désactivé jusqu'à ce que le décodage audio soit terminé.
 
   // Décodage en PCM mono 16 kHz, format attendu par Whisper.
   try {
@@ -145,6 +145,7 @@ async function handleFile(file) {
     state.audioData = rendered.getChannelData(0);
     state.duration = decoded.duration;
     els.fileDuration.textContent = formatDuration(state.duration);
+    els.transcribeButton.disabled = state.busy;
   } catch (err) {
     resetFile();
     showError(
@@ -202,6 +203,9 @@ els.fileRemove.addEventListener('click', resetFile);
 //     sandboxés — bloquent la création de workers (SecurityError).
 
 const fileProgress = new Map();
+// Dès qu'un événement « progress_total » (agrégé) est arrivé, on ignore les
+// estimations par fichier, moins fiables, pour ne pas faire reculer la barre.
+let hasTotalProgress = false;
 
 function updateDownloadProgress() {
   let loaded = 0;
@@ -237,13 +241,14 @@ function onEngineMessage(message) {
     // « progress_total » agrège tous les fichiers du modèle : c'est la
     // mesure la plus fiable, on l'utilise en priorité.
     if (d.status === 'progress_total' && d.total > 0) {
+      hasTotalProgress = true;
       const percent = Math.min(100, Math.round((d.loaded / d.total) * 100));
       els.progressBar.style.width = `${percent}%`;
       setStatus(
         `Téléchargement du modèle… ${percent} % (${formatBytes(d.loaded)} / ${formatBytes(d.total)})`,
         { showProgress: true }
       );
-    } else if (d.status === 'progress' && d.total > 0) {
+    } else if (d.status === 'progress' && d.total > 0 && !hasTotalProgress) {
       fileProgress.set(d.file, { loaded: d.loaded, total: d.total });
       updateDownloadProgress();
     }
@@ -427,10 +432,18 @@ async function transcribe() {
 
   const modelId = MODELS[els.modelSelect.value] ?? MODELS.base;
   const language = els.languageSelect.value;
-  const requestedDevice = (await navigator.gpu?.requestAdapter()) ? 'webgpu' : 'wasm';
+  // Détection GPU protégée : en cas d'échec de requestAdapter(), on reste en WASM.
+  let requestedDevice = 'wasm';
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    if (adapter) requestedDevice = 'webgpu';
+  } catch {
+    // Périphérique GPU non disponible → WASM.
+  }
 
   setStatus('Préparation du modèle…', { showProgress: true });
   fileProgress.clear();
+  hasTotalProgress = false;
 
   let engine;
   try {
@@ -445,9 +458,15 @@ async function transcribe() {
   }
 
   // L'audio n'est envoyé qu'une fois le modèle prêt (voir « ready » dans onEngineMessage).
+  // Sur le worker, le tampon est transféré (détaché) : on envoie donc une copie
+  // pour pouvoir relancer une transcription sans recharger le fichier.
   state.pendingSend = () => {
-    const audio = state.audioData;
-    engine.post({ type: 'transcribe', audio, language }, [audio.buffer]);
+    if (engine.inline) {
+      engine.post({ type: 'transcribe', audio: state.audioData, language });
+    } else {
+      const audio = state.audioData.slice();
+      engine.post({ type: 'transcribe', audio, language }, [audio.buffer]);
+    }
   };
   engine.post({ type: 'load', modelId, device: requestedDevice });
 }
@@ -467,18 +486,31 @@ function updateCount() {
 els.copyButton.addEventListener('click', async () => {
   const text = els.resultTextarea.value;
   if (!text) return;
+  let copied = false;
   try {
     await navigator.clipboard.writeText(text);
+    copied = true;
   } catch {
     // Repli pour les contextes sans Clipboard API (iframe sandbox…)
     els.resultTextarea.select();
-    document.execCommand('copy');
-    els.resultTextarea.setSelectionRange(0, 0);
+    copied = document.execCommand('copy');
   }
-  els.copyButtonLabel.textContent = 'Copié';
-  setTimeout(() => {
-    els.copyButtonLabel.textContent = 'Copier';
-  }, 2000);
+  if (copied) {
+    els.copyButtonLabel.textContent = 'Copié';
+    setTimeout(() => {
+      els.copyButtonLabel.textContent = 'Copier';
+    }, 2000);
+  } else {
+    // Copie automatique bloquée : on sélectionne tout et on guide l'utilisateur.
+    els.resultTextarea.select();
+    els.copyButtonLabel.textContent = 'Copie bloquée';
+    showError(
+      'La copie automatique est bloquée par ce navigateur. Le texte est sélectionné : utilisez Ctrl+C (ou Cmd+C).'
+    );
+    setTimeout(() => {
+      els.copyButtonLabel.textContent = 'Copier';
+    }, 2000);
+  }
 });
 
 els.downloadButton.addEventListener('click', () => {

@@ -58,7 +58,7 @@
           </svg>
           <p class="dropzone-title">Glissez un fichier audio ici</p>
           <p class="dropzone-action">ou <span class="link">parcourez vos fichiers</span></p>
-          <p class="dropzone-hint" id="dropzone-hint">MP3, WAV, OGG, M4A, FLAC, WEBM — jusqu'à plusieurs heures</p>
+          <p class="dropzone-hint" id="dropzone-hint">MP3, WAV, OGG, M4A, FLAC, WEBM — les fichiers longs sont traités par segments</p>
         </button>
       </section>
 
@@ -107,6 +107,11 @@
           </select>
         </div>
       </section>
+
+      <p class="options-note">
+        Tailles approximatives en mode CPU (WASM) ; le mode GPU (WebGPU), plus rapide,
+        télécharge des fichiers plus volumineux.
+      </p>
 
       <button type="button" class="btn btn-primary btn-launch" id="transcribe-button" disabled data-testid="button-transcribe">
         Transcrire l'audio
