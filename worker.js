@@ -101,3 +101,7 @@ self.addEventListener('message', async (event) => {
     });
   }
 });
+
+// Signal de démarrage : la page attend ce message avant d'envoyer des requêtes,
+// car un message posté pendant l'évaluation asynchrone du module serait perdu.
+self.postMessage({ type: 'boot' });

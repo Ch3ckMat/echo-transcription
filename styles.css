@@ -35,6 +35,7 @@
 
 /* Palette : papier chaud, encre, terre cuite */
 :root {
+  color-scheme: light;
   --color-bg: #f7f4ee;
   --color-surface: #fffdf9;
   --color-surface-offset: #efeae0;
@@ -55,6 +56,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --color-bg: #171512;
     --color-surface: #1f1c17;
     --color-surface-offset: #282319;
@@ -62,7 +64,7 @@
     --color-border: #3d3627;
     --color-text: #ece6da;
     --color-text-muted: #a89e8c;
-    --color-text-faint: #6f675a;
+    --color-text-faint: #8d8371;
     --color-primary: #d97a5a;
     --color-primary-hover: #e8946f;
     --color-primary-contrast: #22150d;
@@ -100,6 +102,9 @@ input, button, textarea, select { font: inherit; color: inherit; }
 button { cursor: pointer; background: none; border: none; }
 
 a { color: inherit; }
+
+/* L'attribut hidden doit toujours gagner sur les display:flex/grid des composants */
+[hidden] { display: none !important; }
 
 h1, h2, h3 { text-wrap: balance; line-height: 1.15; }
 
@@ -250,7 +255,14 @@ h1, h2, h3 { text-wrap: balance; line-height: 1.15; }
 }
 .btn:hover { border-color: var(--color-text-faint); background: var(--color-surface-offset); }
 .btn:active { transform: translateY(1px); }
-.btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+/* État désactivé : style explicite lisible dans les deux thèmes (pas d'opacité) */
+.btn:disabled {
+  cursor: not-allowed;
+  transform: none;
+  background: var(--color-surface-offset);
+  border-color: var(--color-divider);
+  color: var(--color-text-faint);
+}
 
 .btn-primary {
   background: var(--color-primary);

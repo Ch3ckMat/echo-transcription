@@ -107,6 +107,9 @@ async function handleFile(file) {
   state.duration = 0;
 
   els.resultCard.hidden = true;
+  // Quand un fichier est chargé, la zone de dépôt devient redondante :
+  // on la masque pour garder le bouton d'action à l'écran.
+  els.dropzone.hidden = true;
   els.fileName.textContent = file.name;
   els.fileSize.textContent = formatBytes(file.size);
   els.fileDuration.textContent = 'analyse…';
@@ -147,6 +150,7 @@ function resetFile() {
   state.audioData = null;
   state.duration = 0;
   els.fileCard.hidden = true;
+  els.dropzone.hidden = false;
   els.audioPlayer.pause();
   els.audioPlayer.removeAttribute('src');
   els.transcribeButton.disabled = true;
@@ -188,6 +192,15 @@ function ensureWorker() {
   if (state.worker) return state.worker;
   const worker = new Worker('worker.js', { type: 'module' });
   worker.addEventListener('message', onWorkerMessage);
+  worker.addEventListener('error', (event) => {
+    hideStatus();
+    setBusy(false);
+    state.pendingLoad = null;
+    state.pendingSend = null;
+    showError(
+      "Le moteur de transcription n'a pas pu démarrer. Vérifiez que votre navigateur est à jour (Chrome, Edge, Firefox ou Safari récent), puis rechargez la page."
+    );
+  });
   state.worker = worker;
   return worker;
 }
@@ -225,9 +238,29 @@ function startElapsedTimer() {
 function onWorkerMessage(event) {
   const message = event.data;
 
+  // Accusé de réception de démarrage : on peut maintenant envoyer les requêtes.
+  if (message.type === 'boot') {
+    state.workerReady = true;
+    if (state.pendingLoad) {
+      const load = state.pendingLoad;
+      state.pendingLoad = null;
+      state.worker.postMessage(load);
+    }
+    return;
+  }
+
   if (message.type === 'progress') {
     const d = message.data;
-    if (d.status === 'progress' && d.total > 0) {
+    // « progress_total » agrège tous les fichiers du modèle : c'est la
+    // mesure la plus fiable, on l'utilise en priorité.
+    if (d.status === 'progress_total' && d.total > 0) {
+      const percent = Math.min(100, Math.round((d.loaded / d.total) * 100));
+      els.progressBar.style.width = `${percent}%`;
+      setStatus(
+        `Téléchargement du modèle… ${percent} % (${formatBytes(d.loaded)} / ${formatBytes(d.total)})`,
+        { showProgress: true }
+      );
+    } else if (d.status === 'progress' && d.total > 0) {
       fileProgress.set(d.file, { loaded: d.loaded, total: d.total });
       updateDownloadProgress();
     }
@@ -297,7 +330,13 @@ async function transcribe() {
     const audio = state.audioData;
     worker.postMessage({ type: 'transcribe', audio, language }, [audio.buffer]);
   };
-  worker.postMessage({ type: 'load', modelId, device: requestedDevice });
+  const loadMessage = { type: 'load', modelId, device: requestedDevice };
+  // Le worker signale son démarrage (« boot ») : on envoie ensuite la requête.
+  if (state.workerReady) {
+    worker.postMessage(loadMessage);
+  } else {
+    state.pendingLoad = loadMessage;
+  }
 }
 
 els.transcribeButton.addEventListener('click', transcribe);
