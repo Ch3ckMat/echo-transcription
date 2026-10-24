@@ -6,15 +6,15 @@ env.allowLocalModels = false;
 
 // Dans certains contextes (iframe sandbox), l'API Cache est bloquée :
 // on la désactive alors pour éviter un échec silencieux du chargement.
-if (typeof caches !== 'undefined') {
-  try {
-    await caches.open('echo-cache-probe');
-  } catch {
-    env.useBrowserCache = false;
-  }
-} else {
-  env.useBrowserCache = false;
+// NB : la simple lecture de `caches` peut lever une exception dans ces contextes.
+let cacheAvailable = false;
+try {
+  cacheAvailable = typeof caches !== 'undefined';
+  if (cacheAvailable) await caches.open('echo-cache-probe');
+} catch {
+  cacheAvailable = false;
 }
+if (!cacheAvailable) env.useBrowserCache = false;
 
 const state = {
   instance: null,

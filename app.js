@@ -1,4 +1,4 @@
-// Écho — logique principale : dépôt du fichier, décodage audio, pilotage du worker.
+// Écho — logique principale : dépôt du fichier, décodage audio, pilotage du moteur.
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -36,11 +36,20 @@ const MODELS = {
   small: 'onnx-community/whisper-small',
 };
 
+const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1';
+// Sur WebGPU, l'encodeur de Whisper est sensible à la quantisation :
+// fp32 pour l'encodeur, q4 pour le décodeur. Sur WASM (CPU), q8 partout.
+const DEVICE_DTYPES = {
+  webgpu: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
+  wasm: 'q8',
+};
+
 const state = {
   file: null,
   audioData: null, // Float32Array 16 kHz mono
   duration: 0,
-  worker: null,
+  engine: null,
+  pendingSend: null,
   busy: false,
   elapsedTimer: null,
   elapsedStart: 0,
@@ -139,7 +148,7 @@ async function handleFile(file) {
   } catch (err) {
     resetFile();
     showError(
-      "Impossible de lire ce fichier audio. Formats acceptés : MP3, WAV, OGG, M4A, FLAC, WEBM. Si le fichier est lisible, essayez un autre format."
+      'Impossible de lire ce fichier audio. Formats acceptés : MP3, WAV, OGG, M4A, FLAC, WEBM. Si le fichier est lisible, essayez un autre format.'
     );
   }
 }
@@ -186,24 +195,11 @@ els.fileInput.addEventListener('change', () => {
 });
 els.fileRemove.addEventListener('click', resetFile);
 
-/* ————— Transcription ————— */
-
-function ensureWorker() {
-  if (state.worker) return state.worker;
-  const worker = new Worker('worker.js', { type: 'module' });
-  worker.addEventListener('message', onWorkerMessage);
-  worker.addEventListener('error', (event) => {
-    hideStatus();
-    setBusy(false);
-    state.pendingLoad = null;
-    state.pendingSend = null;
-    showError(
-      "Le moteur de transcription n'a pas pu démarrer. Vérifiez que votre navigateur est à jour (Chrome, Edge, Firefox ou Safari récent), puis rechargez la page."
-    );
-  });
-  state.worker = worker;
-  return worker;
-}
+/* ————— Moteur de transcription ————— */
+// Deux modes, même protocole de messages :
+//  1. Web Worker (cas général : l'interface reste fluide pendant le calcul) ;
+//  2. Fil principal (repli), car certains contextes intégrés — aperçus
+//     sandboxés — bloquent la création de workers (SecurityError).
 
 const fileProgress = new Map();
 
@@ -235,20 +231,7 @@ function startElapsedTimer() {
   }, 1000);
 }
 
-function onWorkerMessage(event) {
-  const message = event.data;
-
-  // Accusé de réception de démarrage : on peut maintenant envoyer les requêtes.
-  if (message.type === 'boot') {
-    state.workerReady = true;
-    if (state.pendingLoad) {
-      const load = state.pendingLoad;
-      state.pendingLoad = null;
-      state.worker.postMessage(load);
-    }
-    return;
-  }
-
+function onEngineMessage(message) {
   if (message.type === 'progress') {
     const d = message.data;
     // « progress_total » agrège tous les fichiers du modèle : c'est la
@@ -274,7 +257,12 @@ function onWorkerMessage(event) {
 
   if (message.type === 'ready') {
     fileProgress.clear();
-    els.statusEngine.textContent = message.device === 'webgpu' ? 'WebGPU' : 'WASM';
+    els.statusEngine.textContent =
+      message.device === 'webgpu'
+        ? 'WebGPU'
+        : message.inline
+          ? 'CPU · sans worker'
+          : 'WASM';
     startElapsedTimer();
     if (typeof state.pendingSend === 'function') {
       const send = state.pendingSend;
@@ -288,7 +276,9 @@ function onWorkerMessage(event) {
     hideStatus();
     setBusy(false);
     if (!message.text) {
-      showError("Aucune parole n'a été détectée dans ce fichier. Essayez un enregistrement plus proche de la voix, ou vérifiez la langue sélectionnée.");
+      showError(
+        "Aucune parole n'a été détectée dans ce fichier. Essayez un enregistrement plus proche de la voix, ou vérifiez la langue sélectionnée."
+      );
     } else {
       els.resultTextarea.value = message.text;
       els.resultCard.hidden = false;
@@ -305,11 +295,129 @@ function onWorkerMessage(event) {
   }
 }
 
-function updateCount() {
-  const text = els.resultTextarea.value.trim();
-  const words = text ? text.split(/\s+/).length : 0;
-  els.resultCount.textContent = `${words} mot${words > 1 ? 's' : ''} · ${text.length} caractères`;
+/* Création du moteur : worker d'abord, repli fil principal ensuite. */
+async function createEngine() {
+  // 1. Web Worker
+  try {
+    const worker = new Worker('worker.js', { type: 'module' });
+    const booted = await new Promise((resolve) => {
+      const finish = (ok) => {
+        worker.removeEventListener('message', onBoot);
+        worker.removeEventListener('error', onFail);
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const onBoot = (e) => e.data?.type === 'boot' && finish(true);
+      const onFail = () => finish(false);
+      const timer = setTimeout(() => finish(false), 15000);
+      worker.addEventListener('message', onBoot);
+      worker.addEventListener('error', onFail);
+    });
+    if (booted) {
+      worker.addEventListener('message', (e) => onEngineMessage(e.data));
+      worker.addEventListener('error', () => {
+        hideStatus();
+        setBusy(false);
+        state.pendingSend = null;
+        showError(
+          "Le moteur de transcription a été interrompu. Rechargez la page puis relancez la transcription."
+        );
+      });
+      return {
+        post: (message, transfer) => worker.postMessage(message, transfer),
+      };
+    }
+    worker.terminate();
+  } catch (e) {
+    // Workers indisponibles (contexte sandboxé) → repli ci-dessous.
+  }
+
+  // 2. Repli : Transformers.js sur le fil principal
+  const mod = await import(TRANSFORMERS_CDN);
+  const { pipeline, env } = mod;
+  env.allowLocalModels = false;
+  // Dans certains contextes (iframe sandbox), l'API Cache est bloquée :
+  // on la désactive alors pour éviter un échec silencieux du chargement.
+  try {
+    await caches.open('echo-cache-probe');
+  } catch {
+    env.useBrowserCache = false;
+  }
+
+  const engineState = { instance: null, modelId: null, device: null };
+  const notify = (message) => onEngineMessage(message);
+
+  const createPipeline = (modelId, device) =>
+    pipeline('automatic-speech-recognition', modelId, {
+      device,
+      dtype: DEVICE_DTYPES[device] ?? 'q8',
+      progress_callback: (data) => notify({ type: 'progress', data }),
+    });
+
+  return {
+    inline: true,
+    async post(message) {
+      try {
+        if (message.type === 'load') {
+          if (
+            engineState.instance === null ||
+            engineState.modelId !== message.modelId ||
+            engineState.device !== message.device
+          ) {
+            if (engineState.instance !== null) {
+              await engineState.instance.dispose();
+            }
+            let device = message.device;
+            try {
+              engineState.instance = await createPipeline(message.modelId, device);
+            } catch (err) {
+              // Repli : si WebGPU échoue (pilote, mémoire…), on retente en WASM.
+              if (device === 'webgpu') {
+                notify({
+                  type: 'info',
+                  message: 'WebGPU indisponible, bascule vers le processeur (WASM).',
+                });
+                device = 'wasm';
+                engineState.instance = await createPipeline(message.modelId, device);
+              } else {
+                throw err;
+              }
+            }
+            engineState.modelId = message.modelId;
+            engineState.device = device;
+          }
+          notify({ type: 'ready', device: engineState.device, inline: true });
+          return;
+        }
+
+        if (message.type === 'transcribe') {
+          if (engineState.instance === null) throw new Error("Le modèle n'est pas chargé.");
+          const output = await engineState.instance(message.audio, {
+            // Fenêtre glissante : segments de 30 s avec recouvrement de 5 s
+            // pour ne rien perdre ni dupliquer sur les fichiers longs.
+            chunk_length_s: 30,
+            stride_length_s: 5,
+            language: message.language || null,
+            task: 'transcribe',
+          });
+          notify({ type: 'result', text: (output?.text ?? '').trim() });
+        }
+      } catch (err) {
+        notify({
+          type: 'error',
+          message: err?.message || "Une erreur inattendue s'est produite.",
+        });
+      }
+    },
+  };
 }
+
+async function getEngine() {
+  if (!state.engine) state.engine = await createEngine();
+  return state.engine;
+}
+
+/* ————— Transcription ————— */
 
 async function transcribe() {
   if (!state.file || !state.audioData || state.busy) return;
@@ -324,19 +432,24 @@ async function transcribe() {
   setStatus('Préparation du modèle…', { showProgress: true });
   fileProgress.clear();
 
-  const worker = ensureWorker();
-  // L'audio n'est envoyé qu'une fois le modèle prêt (voir « ready » dans onWorkerMessage).
+  let engine;
+  try {
+    engine = await getEngine();
+  } catch (err) {
+    hideStatus();
+    setBusy(false);
+    showError(
+      "Le moteur de transcription n'a pas pu démarrer. Vérifiez votre connexion (le modèle se télécharge depuis un CDN), puis rechargez la page."
+    );
+    return;
+  }
+
+  // L'audio n'est envoyé qu'une fois le modèle prêt (voir « ready » dans onEngineMessage).
   state.pendingSend = () => {
     const audio = state.audioData;
-    worker.postMessage({ type: 'transcribe', audio, language }, [audio.buffer]);
+    engine.post({ type: 'transcribe', audio, language }, [audio.buffer]);
   };
-  const loadMessage = { type: 'load', modelId, device: requestedDevice };
-  // Le worker signale son démarrage (« boot ») : on envoie ensuite la requête.
-  if (state.workerReady) {
-    worker.postMessage(loadMessage);
-  } else {
-    state.pendingLoad = loadMessage;
-  }
+  engine.post({ type: 'load', modelId, device: requestedDevice });
 }
 
 els.transcribeButton.addEventListener('click', transcribe);
@@ -345,13 +458,19 @@ els.transcribeButton.addEventListener('click', transcribe);
 
 els.resultTextarea.addEventListener('input', updateCount);
 
+function updateCount() {
+  const text = els.resultTextarea.value.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  els.resultCount.textContent = `${words} mot${words > 1 ? 's' : ''} · ${text.length} caractères`;
+}
+
 els.copyButton.addEventListener('click', async () => {
   const text = els.resultTextarea.value;
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
   } catch {
-    // Repli pour les contextes sans Clipboard API (iframe non sécurisée…)
+    // Repli pour les contextes sans Clipboard API (iframe sandbox…)
     els.resultTextarea.select();
     document.execCommand('copy');
     els.resultTextarea.setSelectionRange(0, 0);
